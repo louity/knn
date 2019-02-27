@@ -37,12 +37,15 @@ parser.add_argument('-b', '--batch-size', default=1, type=int,
                     metavar='N', help='mini-batch size (default: 1)')
 parser.add_argument('--classes', nargs='+', default=[0, 1], type=int,
                     metavar='N', help='classes on which nearest neighbors is performed')
-parser.add_argument('--index-type', default='flat', type=str,
-                    metavar='N', help='type of index (flat or flat_voronoi)')
-parser.add_argument('--n-voronoi-cells', default=1000, type=int,
-                    metavar='N', help='number of vornoi cells for index')
+parser.add_argument('--index-string', default='PCAR96,IVF262144_HNSW32,SQ8', type=str,
+        metavar='N', help='string that characterizes the index (see https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index )')
+parser.add_argument('--index-nprobe', default=4, type=int,
+                    metavar='N', help='number of vornoi cells to be visited')
+
 parser.add_argument('--patch-decision-method', nargs='+', default=['vote'], type=str,
                     metavar='N', help='method to decide wether a patch belongs to a class or not')
+parser.add_argument('--compression-factor', default=10, type=int,
+                    metavar='N', help='compression factor for productt quantizer of vectors')
 
 
 class SubsetSampler(torch.utils.data.sampler.Sampler):
@@ -119,15 +122,9 @@ def main():
     def unfold(x):
         return unfold_func(x).transpose(1, 2) # shape batch_size, n_patches, 3*args.patch_size**2
 
-    print('Building index of type {} ...'.format(args.index_type))
-
-    if args.index_type == 'flat':
-        index = faiss.IndexFlatL2(dimension)
-    elif args.index_type == 'flat_voronoi':
-        nlist = args.n_voronoi_cells
-        quantizer = faiss.IndexFlatL2(dimension)
-        index = faiss.IndexIVFFlat(quantizer, dimension, nlist, faiss.METRIC_L2)
-        index.nprobe = 1
+    print('Building index  {} using nprobe={}...'.format(args.index_string, args.index_nprobe))
+    index = faiss.index_factory(dimension, args.index_string)
+    index.nprobe = args.index_nprobe
 
     traindir = os.path.join(args.data, 'train')
     valdir = os.path.join(args.data, 'val')
@@ -155,29 +152,29 @@ def main():
     n_classes = len(args.classes)
 
     # get all patches to train the index
-    if args.index_type in ['flat_voronoi']:
-        print('Creating voronoi cells...')
-        train_indices, _ = get_imagenet_class_indices(args.classes)
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=128, shuffle=False,
-            num_workers=args.workers, pin_memory=True, sampler=SubsetSampler(train_indices))
 
-        patches = None
-        start_index = 0
-        for i, (input, target) in enumerate(train_loader):
-            if target[0].item() not in args.classes:
-                raise Exception('train loader not working, got target of class {} not in {}'.format(target[0].item(), args.classes))
+    print('Training index...')
+    train_indices, _ = get_imagenet_class_indices(args.classes)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=128, shuffle=False,
+        num_workers=args.workers, pin_memory=True, sampler=SubsetSampler(train_indices))
 
-            input_patches = unfold(input).contiguous().view(-1, dimension).numpy()
+    patches = None
+    start_index = 0
+    for i, (input, target) in enumerate(train_loader):
+        if target[0].item() not in args.classes:
+            raise Exception('train loader not working, got target of class {} not in {}'.format(target[0].item(), args.classes))
 
-            if patches is None:
-                patches = np.zeros((1300*n_classes*(input_patches.shape[0]//input.size(0)), dimension), dtype='float32') #FIXME
+        input_patches = unfold(input).contiguous().view(-1, dimension).numpy()
 
-            patches[start_index:start_index+input_patches.shape[0], :] = input_patches
-            start_index += input_patches.shape[0]
+        if patches is None:
+            patches = np.zeros((1300*n_classes*(input_patches.shape[0]//input.size(0)), dimension), dtype='float32') #FIXME
 
-        index.train(patches)
-        del patches
+        patches[start_index:start_index+input_patches.shape[0], :] = input_patches
+        start_index += input_patches.shape[0]
+
+    index.train(patches)
+    del patches
 
     print('Training nearest neighbors...')
     train_start_time = time.time()
